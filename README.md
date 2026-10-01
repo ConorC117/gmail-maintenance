@@ -1,4 +1,4 @@
-# Gmail maintenance
+# Gmail Maintenance
 
 A rule-based Gmail organizer and retention system built with Google Apps Script.
 
@@ -106,7 +106,7 @@ Open Google Apps Script and create a new standalone project:
 
 `https://script.google.com/`
 
-Give the project a name such as `Gmail Maintainence`.
+Give the project a name such as `Gmail Maintenance`.
 
 ### 2. Add the source files
 
