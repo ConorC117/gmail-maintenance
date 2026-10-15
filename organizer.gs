@@ -1,3 +1,5 @@
+const ORGANIZER_BATCH_SIZE = 100;
+
 const MANAGED_LABELS_PROPERTY =
   "managedLabels";
 
@@ -71,9 +73,8 @@ function organizeCurrentLabels() {
     const candidateMessages =
       getKnownMessagesForQuery(
         rule,
-        `-label:${quoteGmailLabel(
-          rule.label
-        )}`
+      `-label:${quoteGmailLabel(rule.label)}`,
+      ORGANIZER_BATCH_SIZE
       );
 
     const processedThreadIds =
