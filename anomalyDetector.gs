@@ -1,276 +1,436 @@
+
 const ANOMALY_MAX_SAMPLES = 10;
+const ANOMALY_BATCH_SIZE = 100;
+const ANOMALY_WINDOW_DAYS = 30;
+const ANOMALY_TIME_BUDGET_MS = 240000;
 
 const ANOMALY_STATE_PREFIX =
-  "anomalyVerification:";
+  "anomalyVerificationV4:";
 
 
 /*
  * ============================================================
  * Anomaly detection
  * ============================================================
+ *
+ * Validates messages from senders whose rules use
+ * knownFormats.
+ *
+ * Rules sharing a sender are evaluated together.
+ *
+ * Historical mail is scanned in bounded date windows.
+ * Completed windows are remembered between executions.
+ *
+ * Only fully checked windows advance the verification state.
+ *
+ * Anomalies prevent further advancement until addressed.
+ *
+ * No global all-rule lookup is required.
  */
 
 
 /*
- * Checks rules using knownFormats for messages that belong to
- * the rule's broad population but are not recognized by any
- * currently configured rule.
- *
- * This provides a safety layer for broad sender rules.
- *
- * Example:
- *
- *   Base query:
- *     from:jobs@example.com
- *
- *   Known formats:
- *     "jobs recommended for you"
- *     "new jobs matching your search"
- *
- * If that sender introduces a new message format, the message
- * is reported as an anomaly rather than silently being treated
- * as known.
- *
- * Successful verification is persisted between runs. Once a
- * rule's history has been verified, later runs only need to
- * inspect messages received since the previous successful
- * verification.
- *
- * Changing the rule's classification criteria invalidates the
- * saved verification state and causes a full recheck.
+ * Main entry point.
  */
 function detectAnomalies() {
-  const scanStartedAt =
-    Math.floor(
-      Date.now() / 1000
-    );
+  const deadline =
+    Date.now() + ANOMALY_TIME_BUDGET_MS;
 
-  for (const rule of RULES) {
-    /*
-     * Rules without knownFormats define their entire query 
-     * population as recognized, so they have no unknown-format 
-     * subset to test.
-     */
-    if (!rule.knownFormats) {
-      continue;
+  for (const group of getAnomalySenderGroups()) {
+    if (Date.now() >= deadline) {
+      console.log(
+        "Anomaly detection: time budget reached."
+      );
+      return;
     }
 
-    const fingerprint =
-      getRuleFingerprint(
-        rule
-      );
-
-    const state =
-      getAnomalyVerificationState(
-        rule
-      );
-
-    const stateIsCurrent =
-      state &&
-      state.fingerprint ===
-        fingerprint &&
-      Number.isFinite(
-        state.verifiedThrough
-      );
-
-    /*
-     * If the rule has already been successfully verified with
-     * the same classification criteria, inspect only messages
-     * newer than that verification watermark.
-     *
-     * Otherwise, validate the complete rule population.
-     */
-    const extraQuery =
-      stateIsCurrent
-        ? `after:${state.verifiedThrough}`
-        : "";
-
-    const population =
-      getRuleMessagesForQuery(
-        rule,
-        extraQuery
-      );
-
-    /*
-     * A message may be unknown to this particular rule but
-     * intentionally recognized by another rule.
-     *
-     * Restrict the cross-rule lookup to the same incremental
-     * window when possible.
-     */
-    const allKnownMessageIds =
-      getAllKnownMessageIdsForQuery(
-        extraQuery
-      );
-
-    const anomalies = [];
-
-    for (
-      const message of population
-    ) {
-      if (
-        allKnownMessageIds.has(
-          message.getId()
-        )
-      ) {
-        continue;
-      }
-
-      anomalies.push(
-        message
-      );
-
-      if (
-        anomalies.length >=
-        ANOMALY_MAX_SAMPLES
-      ) {
-        break;
-      }
-    }
-
-    if (anomalies.length > 0) {
-      console.warn(
-        `${rule.name}: ` +
-        `${anomalies.length}` +
-        (
-          anomalies.length ===
-          ANOMALY_MAX_SAMPLES
-            ? "+"
-            : ""
-        ) +
-        ` anomaly sample(s) found.`
-      );
-
-      for (
-        const message of anomalies
-      ) {
-        console.warn(
-          `  ${message.getDate().toISOString()} ` +
-          `| ${message.getFrom()} ` +
-          `| ${message.getSubject()} ` +
-          `| ${message.getId()}`
-        );
-      }
-
-      /*
-       * Do not advance the verification watermark while
-       * anomalies exist. The population will be checked again
-       * on the next run.
-       */
-      continue;
-    }
-
-    /*
-     * No anomalies were found, so everything up to the start
-     * of this scan can be considered verified.
-     */
-    saveAnomalyVerificationState(
-      rule,
-      {
-        fingerprint: fingerprint,
-        verifiedThrough:
-          scanStartedAt
-      }
-    );
-
-    console.log(
-      `${rule.name}: verified through ` +
-      `${new Date(
-        scanStartedAt * 1000
-      ).toISOString()}`
-    );
+    scanAnomalySender(group, deadline);
   }
 }
 
 
 /*
  * ============================================================
- * Verification state
+ * Sender grouping
+ * ============================================================
+ */
+
+function getAnomalySenderGroups() {
+  const groups = new Map();
+
+  for (const rule of RULES) {
+    const match = rule.query.match(
+      /(?:^|\s)from:([^\s]+)/i
+    );
+
+    if (!match) {
+      continue;
+    }
+
+    const sender = match[1].toLowerCase();
+
+    if (!groups.has(sender)) {
+      groups.set(sender, {
+        sender,
+        rules: []
+      });
+    }
+
+    groups.get(sender).rules.push(rule);
+  }
+
+  return Array.from(groups.values())
+    .filter(group =>
+      group.rules.some(rule => rule.knownFormats)
+    );
+}
+
+
+/*
+ * ============================================================
+ * Sender validation
+ * ============================================================
+ */
+
+function scanAnomalySender(group, deadline) {
+  const properties =
+    PropertiesService.getScriptProperties();
+
+  const stateKey =
+    ANOMALY_STATE_PREFIX + group.sender;
+
+  const fingerprint =
+    getAnomalyGroupFingerprint(group);
+
+  let state = null;
+
+  const stored =
+    properties.getProperty(stateKey);
+
+  if (stored) {
+    try {
+      state = JSON.parse(stored);
+    } catch (error) {
+      state = null;
+    }
+  }
+
+  /*
+   * Initialize a new historical scan whenever the
+   * classification criteria change.
+   */
+  if (
+    !state ||
+    state.fingerprint !== fingerprint
+  ) {
+    const oldest =
+      getAnomalyOldestMessageDate(
+        group.sender
+      );
+
+    if (oldest === null) {
+      console.log(
+        `${group.sender}: no messages found.`
+      );
+      return;
+    }
+
+    state = {
+      fingerprint,
+      verifiedThrough: oldest,
+      initialized: true
+    };
+  }
+
+  const scanStartedAt =
+    Math.floor(Date.now() / 1000);
+
+  const windowSeconds =
+    ANOMALY_WINDOW_DAYS * 86400;
+
+  const windowStart =
+    state.verifiedThrough;
+
+  if (windowStart >= scanStartedAt) {
+    console.log(
+      `${group.sender}: already verified.`
+    );
+    return;
+  }
+
+  const windowEnd =
+    Math.min(
+      windowStart + windowSeconds,
+      scanStartedAt
+    );
+
+  const dateQuery =
+    `after:${windowStart} before:${windowEnd}`;
+
+  /*
+   * Retrieve the sender's population within this window.
+   */
+  const populationIds =
+    listAnomalyMessageIds(
+      `from:${group.sender} ${dateQuery}`,
+      deadline
+    );
+
+  if (populationIds === null) {
+    return;
+  }
+
+  /*
+   * Retrieve recognized IDs separately for each effective
+   * rule query, preserving the original query semantics.
+   */
+  const recognizedIds = new Set();
+
+  for (
+    const query of
+    getAnomalyRecognizedQueries(group)
+  ) {
+    const ids =
+      listAnomalyMessageIds(
+        `${query} ${dateQuery}`,
+        deadline
+      );
+
+    if (ids === null) {
+      return;
+    }
+
+    for (const id of ids) {
+      recognizedIds.add(id);
+    }
+  }
+
+  /*
+   * Compare the complete population against the union of
+   * recognized messages.
+   */
+  const unknownIds =
+    Array.from(populationIds)
+      .filter(id =>
+        !recognizedIds.has(id)
+      );
+
+  if (unknownIds.length > 0) {
+    console.warn(
+      `${group.sender}: ` +
+      `${unknownIds.length} unrecognized message(s).`
+    );
+
+    for (
+      const id of
+      unknownIds.slice(
+        0,
+        ANOMALY_MAX_SAMPLES
+      )
+    ) {
+      if (Date.now() >= deadline) {
+        return;
+      }
+
+      const message =
+        Gmail.Users.Messages.get(
+          "me",
+          id,
+          {
+            format: "metadata",
+            metadataHeaders: [
+              "From",
+              "Subject",
+              "Date"
+            ]
+          }
+        );
+
+      const headers =
+        message.payload?.headers || [];
+
+      const getHeader = name =>
+        headers.find(
+          header =>
+            header.name.toLowerCase() ===
+            name.toLowerCase()
+        )?.value || "";
+
+      console.warn(
+        `  ${getHeader("Date")} | ` +
+        `${getHeader("From")} | ` +
+        `${getHeader("Subject")} | ${id}`
+      );
+    }
+
+    /*
+     * Do not advance while anomalies remain.
+     */
+    properties.setProperty(
+      stateKey,
+      JSON.stringify(state)
+    );
+
+    return;
+  }
+
+  /*
+   * The window was fully checked with no anomalies.
+   */
+  state.verifiedThrough = windowEnd;
+
+  properties.setProperty(
+    stateKey,
+    JSON.stringify(state)
+  );
+
+  console.log(
+    `${group.sender}: verified ` +
+    `${new Date(windowStart * 1000).toISOString()} ` +
+    `through ` +
+    `${new Date(windowEnd * 1000).toISOString()}.`
+  );
+}
+
+
+/*
+ * ============================================================
+ * Gmail message listing
  * ============================================================
  */
 
 
 /*
- * Loads the persisted anomaly-verification state for a rule.
+ * Lists all matching message IDs, with pagination.
  *
- * Invalid or missing state is treated as no prior
- * verification, causing the rule to receive a full scan.
+ * Returns null if the time budget is reached.
+ *
+ * The caller must not advance verification state when
+ * a query returns null.
  */
-function getAnomalyVerificationState(
-  rule
-) {
-  const properties =
-    PropertiesService
-      .getScriptProperties();
+function listAnomalyMessageIds(query, deadline) {
+  const ids = new Set();
+  let pageToken;
 
-  const value =
-    properties.getProperty(
-      getAnomalyVerificationKey(
-        rule
-      )
-    );
-
-  if (!value) {
-    return null;
-  }
-
-  try {
-    const state =
-      JSON.parse(value);
-
-    if (
-      !state ||
-      typeof state !== "object"
-    ) {
+  do {
+    if (Date.now() >= deadline) {
+      console.log(
+        "Anomaly detection: time budget reached."
+      );
       return null;
     }
 
-    return state;
-  } catch (error) {
-    console.warn(
-      `${rule.name}: invalid anomaly ` +
-      `verification state; performing ` +
-      `a full scan.`
+    const response =
+      Gmail.Users.Messages.list(
+        "me",
+        {
+          q: query,
+          maxResults: ANOMALY_BATCH_SIZE,
+          ...(pageToken
+            ? { pageToken }
+            : {})
+        }
+      );
+
+    for (
+      const message of
+      response.messages || []
+    ) {
+      ids.add(message.id);
+    }
+
+    pageToken =
+      response.nextPageToken;
+
+  } while (pageToken);
+
+  return ids;
+}
+
+
+/*
+ * ============================================================
+ * Historical scan initialization
+ * ============================================================
+ */
+
+
+/*
+ * Finds the oldest message from a sender.
+ *
+ * Uses a bounded search to establish the beginning of the
+ * historical scan.
+ */
+function getAnomalyOldestMessageDate(sender) {
+  const threads =
+    GmailApp.search(
+      `from:${sender}`,
+      0,
+      1
     );
 
+  if (threads.length === 0) {
     return null;
   }
+
+  /*
+   * Gmail search returns newest threads first, so the first
+   * result cannot establish the oldest historical message.
+   *
+   * Start from the Unix epoch instead. Empty windows are
+   * inexpensive, and verification will advance gradually.
+   */
+  return 0;
 }
 
 
 /*
- * Persists the latest successful verification state for a
- * rule.
+ * ============================================================
+ * Recognition queries
+ * ============================================================
  */
-function saveAnomalyVerificationState(
-  rule,
-  state
-) {
-  const properties =
-    PropertiesService
-      .getScriptProperties();
 
-  properties.setProperty(
-    getAnomalyVerificationKey(
-      rule
-    ),
-    JSON.stringify(state)
-  );
+function getAnomalyRecognizedQueries(group) {
+  const queries = [];
+
+  for (const rule of group.rules) {
+    if (!rule.knownFormats) {
+      queries.push(rule.query);
+      continue;
+    }
+
+    for (const format of rule.knownFormats) {
+      queries.push(
+        `${rule.query} ${format.query}`
+      );
+    }
+  }
+
+  return [...new Set(queries)];
 }
 
 
 /*
- * Returns the Script Properties key used to store a rule's
- * anomaly-verification state.
- *
- * Rule names therefore act as stable identifiers for this
- * state.
+ * ============================================================
+ * Classification fingerprint
+ * ============================================================
  */
-function getAnomalyVerificationKey(
-  rule
-) {
-  return (
-    ANOMALY_STATE_PREFIX +
-    rule.name
-  );
+
+function getAnomalyGroupFingerprint(group) {
+  const queries =
+    getAnomalyRecognizedQueries(group).sort();
+
+  const digest =
+    Utilities.computeDigest(
+      Utilities.DigestAlgorithm.SHA_256,
+      JSON.stringify(queries)
+    );
+
+  return digest
+    .map(byte =>
+      (byte & 0xff)
+        .toString(16)
+        .padStart(2, "0")
+    )
+    .join("");
 }
