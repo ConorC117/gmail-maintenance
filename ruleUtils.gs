@@ -55,27 +55,26 @@ function getRuleMessages(rule) {
  */
 function getRuleMessagesForQuery(
   rule,
-  extraQuery = ""
+  extraQuery = "",
+  maxThreads = null
 ) {
   const query =
     `${rule.query} ${extraQuery}`.trim();
 
   const threads =
-    GmailApp.search(query);
+    maxThreads === null
+      ? GmailApp.search(query)
+      : GmailApp.search(
+          query,
+          0,
+          maxThreads
+        );
 
   const messages = [];
 
   for (const thread of threads) {
-    for (
-      const message of
-      thread.getMessages()
-    ) {
-      if (
-        messageMatchesRule(
-          rule,
-          message
-        )
-      ) {
+    for (const message of thread.getMessages()) {
+      if (messageMatchesRule(rule, message)) {
         messages.push(message);
       }
     }
@@ -235,67 +234,40 @@ function getAllKnownMessageIdsForQuery(
  */
 function getKnownMessagesForQuery(
   rule,
-  extraQuery = ""
+  extraQuery = "",
+  maxThreads = null
 ) {
-  const messagesById =
-    new Map();
+  const messagesById = new Map();
 
-  if (!rule.knownFormats) {
-    const messages =
-      getRuleMessagesForQuery(
-        rule,
-        extraQuery
-      );
+  const queries = rule.knownFormats
+    ? rule.knownFormats.map(
+        format =>
+          `${rule.query} ${format.query} ${extraQuery}`.trim()
+      )
+    : [
+        `${rule.query} ${extraQuery}`.trim()
+      ];
 
-    for (const message of messages) {
-      messagesById.set(
-        message.getId(),
-        message
-      );
-    }
-
-    return Array.from(
-      messagesById.values()
-    );
-  }
-
-  for (
-    const format of
-    rule.knownFormats
-  ) {
-    const query =
-      `${rule.query} ` +
-      `${format.query} ` +
-      `${extraQuery}`;
-
+  for (const query of queries) {
     const threads =
-      GmailApp.search(
-        query.trim()
-      );
+      maxThreads === null
+        ? GmailApp.search(query)
+        : GmailApp.search(
+            query,
+            0,
+            maxThreads
+          );
 
     for (const thread of threads) {
-      for (
-        const message of
-        thread.getMessages()
-      ) {
-        if (
-          messageMatchesRule(
-            rule,
-            message
-          )
-        ) {
-          messagesById.set(
-            message.getId(),
-            message
-          );
+      for (const message of thread.getMessages()) {
+        if (messageMatchesRule(rule, message)) {
+          messagesById.set(message.getId(), message);
         }
       }
     }
   }
 
-  return Array.from(
-    messagesById.values()
-  );
+  return Array.from(messagesById.values());
 }
 
 
