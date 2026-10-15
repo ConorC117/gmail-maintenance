@@ -1,3 +1,5 @@
+const ORGANIZER_BATCH_SIZE = 100;
+
 const MANAGED_LABELS_PROPERTY =
   "managedLabels";
 
